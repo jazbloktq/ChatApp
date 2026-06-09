@@ -193,13 +193,22 @@ setInterval(() => checkServerUpdate(), UPDATE_CHECK_INTERVAL_MS);
 const http = require("http");
 const PORT = process.env.PORT || 4242;
 
-// HTTP server handles health checks (for cron-job.org keepalive) AND WebSocket upgrades
+// HTTP server handles health checks (for cron-job.org keepalive) AND WebSocket upgrades.
+// Using noServer+manual upgrade so plain GET pings always return 200 OK.
 const httpServer = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/plain" });
   res.end("OK");
 });
 
-const wss = new WebSocket.Server({ server: httpServer, maxPayload: 80 * 1024 * 1024 });
+const wss = new WebSocket.Server({ noServer: true, maxPayload: 80 * 1024 * 1024 });
+
+// Only upgrade to WebSocket when the client actually sends a WS handshake
+httpServer.on("upgrade", (req, socket, head) => {
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
+});
+
 httpServer.listen(PORT);
 
 // Collect all IPs that belong to THIS machine so we can identify connections
