@@ -1,13 +1,12 @@
 const WebSocket = require("ws");
 const os = require("os");
+const dgram = require("dgram");
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
-const { execSync, spawn } = require("child_process");
+const { execSync } = require("child_process");
 
 const SERVER_VERSION = "1.2.0";
-const GITHUB_SERVER_URL = "https://raw.githubusercontent.com/jazbloktq/ChatApp/refs/heads/main/src/server";
-const UPDATE_CHECK_INTERVAL_MS = 20 * 60 * 1000; // 20 minutes
 const SELF_PATH = path.resolve(__filename);
 const DB_PATH = path.join(__dirname, "users.json");
 
@@ -91,125 +90,11 @@ function countAccountsForDevice(db, deviceId) {
   return Object.values(db.accounts || {}).filter(acc => String(acc?.deviceId || "") === key).length;
 }
 
-// ── SELF-UPDATE ──
-function fetchRaw(url) {
-  return new Promise((resolve, reject) => {
-    https.get(url + "?_=" + Date.now(), { headers: { "User-Agent": "LanChat-Updater/1.0" } }, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
-        return fetchRaw(res.headers.location).then(resolve).catch(reject);
-      }
-      if (res.statusCode !== 200) return reject(new Error(`HTTP ${res.statusCode}`));
-      const chunks = [];
-      res.on("data", c => chunks.push(c));
-      res.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-      res.on("error", reject);
-    }).on("error", reject);
-  });
-}
 
-function parseServerVersion(src) {
-  const m = src.match(/SERVER_VERSION\s*=\s*["']([^"']+)["']/);
-  return m ? m[1] : null;
-}
 
-function versionIsNewer(remote, local) {
-  const r = remote.split(".").map(Number);
-  const l = local.split(".").map(Number);
-  for (let i = 0; i < Math.max(r.length, l.length); i++) {
-    const rv = r[i] || 0, lv = l[i] || 0;
-    if (rv > lv) return true;
-    if (rv < lv) return false;
-  }
-  return false;
-}
-
-let updatePromptActive = false; // prevent stacking prompts
-
-async function checkServerUpdate() {
-  if (updatePromptActive) return;
-  try {
-    const src = await fetchRaw(GITHUB_SERVER_URL);
-    const remoteVersion = parseServerVersion(src);
-    if (!remoteVersion) return;
-    if (!versionIsNewer(remoteVersion, SERVER_VERSION)) return;
-
-    updatePromptActive = true;
-    console.log(`\n╔══════════════════════════════════════════════════╗`);
-    console.log(`║  ⚡  Server update available: v${SERVER_VERSION} → v${remoteVersion}`.padEnd(51) + `║`);
-    console.log(`║  Update now? Server will restart automatically.  ║`);
-    console.log(`╚══════════════════════════════════════════════════╝`);
-    process.stdout.write("  → Update now? [Y/n]: ");
-
-    const readline = require("readline");
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: false });
-
-    // Read one line then close
-    rl.once("line", async (answer) => {
-      rl.close();
-      updatePromptActive = false;
-      const yes = answer.trim().toLowerCase();
-      if (yes === "" || yes === "y" || yes === "yes") {
-        console.log("\n[updater] Writing update…");
-        fs.writeFileSync(SELF_PATH, src, "utf8");
-        console.log("[updater] File written. Restarting…\n");
-
-        // Notify connected clients
-        try {
-          const notice = JSON.stringify({ type: "system", text: "⚡ Server updating to v" + remoteVersion + " — reconnecting shortly…", context: "general", ts: Date.now() });
-          for (const [ws] of clients) {
-            if (ws.readyState === WebSocket.OPEN) ws.send(notice);
-          }
-        } catch {}
-
-        setTimeout(() => {
-          const child = spawn(process.execPath, [SELF_PATH], {
-            detached: true,
-            stdio: "inherit",
-            env: process.env,
-            cwd: process.cwd()
-          });
-          child.unref();
-          process.exit(0);
-        }, 1500);
-      } else {
-        console.log("[updater] Skipped. Will ask again in 20 minutes.\n");
-      }
-    });
-
-    // If stdin closes (non-interactive / piped), skip silently
-    rl.once("close", () => {
-      updatePromptActive = false;
-    });
-
-  } catch (e) {
-    // Network unavailable or fetch failed — silently skip
-  }
-}
-
-// Check after a short startup delay, then every 20 minutes
-setTimeout(() => checkServerUpdate(), 10000);
-setInterval(() => checkServerUpdate(), UPDATE_CHECK_INTERVAL_MS);
-
-// ── Test OpenRouter key at startup ──
-setTimeout(() => {
-  callOpenRouter(AI_MODELS[0], [{ role: 'user', content: 'say "ok"' }])
-    .then(r => console.log(`[AI] Key OK — model: ${r.model}`))
-    .catch(e => console.error(`[AI] Key test FAILED: ${e.message}`));
-}, 5000);
-
-const http = require("http");
-const PORT = process.env.PORT || 4242;
-
-// HTTP server: plain requests return 200 OK (health checks), WS upgrades go to wss
-const httpServer = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("OK");
-});
-
-const wss = new WebSocket.Server({ server: httpServer, maxPayload: 80 * 1024 * 1024 });
-httpServer.listen(PORT, () => {
-  console.log("[server] Listening on port " + PORT);
-});
+const PORT = 4242;
+const DISCOVERY_PORT = 42424;
+const wss = new WebSocket.Server({ port: PORT, maxPayload: 80 * 1024 * 1024 });
 
 // Collect all IPs that belong to THIS machine so we can identify connections
 // from the same device (host machine), whether they connect via localhost OR their LAN IP.
@@ -263,7 +148,7 @@ function callOpenRouter(model, messages) {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + AI_KEY,
-        'HTTP-Referer': 'https://chatapp-4gbn.onrender.com',
+        'HTTP-Referer': 'https://lanchat.local',
         'X-Title': 'LAN Chat AI Bot',
         'Content-Length': Buffer.byteLength(body),
       },
@@ -273,24 +158,14 @@ function callOpenRouter(model, messages) {
       res.on('data', c => chunks.push(c));
       res.on('end', () => {
         try {
-          const raw = Buffer.concat(chunks).toString('utf8');
-          const data = JSON.parse(raw);
-          if (data.error) {
-            console.error(`[AI] OpenRouter error for ${model}: ${JSON.stringify(data.error)}`);
-            return reject(new Error(data.error.message || 'API error'));
-          }
+          const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+          if (data.error) return reject(new Error(data.error.message || 'API error'));
           const text = data.choices?.[0]?.message?.content;
-          if (!text) {
-            console.error(`[AI] No text in response for ${model}. HTTP ${res.statusCode}. Body: ${raw.slice(0, 300)}`);
-            return reject(new Error('No response text'));
-          }
+          if (!text) return reject(new Error('No response text'));
           resolve({ text, model: data.model || model });
-        } catch (e) {
-          console.error(`[AI] JSON parse error for ${model}:`, e.message);
-          reject(e);
-        }
+        } catch (e) { reject(e); }
       });
-      res.on('error', (e) => { console.error(`[AI] Request error for ${model}:`, e.message); reject(e); });
+      res.on('error', reject);
     });
     req.on('error', reject);
     req.setTimeout(30000, () => { req.destroy(new Error('timeout')); });
@@ -395,10 +270,9 @@ async function handleAiCommand(ws, client, data, triggerMsg, room, isDM) {
       response = await callOpenRouter(model, apiMessages);
       break;
     } catch (e) {
-      console.error(`[AI] Model ${model} failed:`, e.message);
+      // try next model
     }
   }
-  if (!response) console.error("[AI] All models failed.");
 
   let replyText;
   try {
@@ -771,7 +645,6 @@ function makeContextMessage(client, data, clientId, color) {
     id: nextMsgId(),
     name: client.name,
     senderId: clientId,
-    accountId: client.accountId || null,
     color,
     text: String(data.text || "").slice(0, 6000),
     image,
@@ -1265,29 +1138,7 @@ wss.on("connection", (ws, req) => {
         return;
       }
 
-      let record = userDb.accounts[username];
-
-      // ── AUTO-RESTORE ──
-      // If the account doesn't exist (e.g. server restarted and wiped users.json)
-      // but the client sent a deviceId + full profile, silently recreate it.
-      // This makes server restarts invisible to users who already have an account
-      // saved on their device.
-      if (!record && deviceId && data.displayName) {
-        console.log(`[auth] Auto-restoring account for "${username}" (server was restarted)`);
-        const restored = normalizeAccount(username, {
-          id: userDb.nextUserId++,
-          password,
-          displayName: String(data.displayName || username).trim().slice(0, 24),
-          aboutMe: String(data.aboutMe || "").slice(0, 240),
-          avatarUrl: String(data.avatarUrl || "").slice(0, 500),
-          deviceId,
-          settings: data.settings || {},
-        });
-        userDb.accounts[username] = restored;
-        saveUserDb(userDb);
-        record = restored;
-      }
-
+      const record = userDb.accounts[username];
       if (!record || String(record.password || "") !== password) {
         sendTo(ws, { type: "error", message: "Invalid username or password" });
         setTimeout(() => { try { ws.close(1008, "Invalid auth"); } catch {} }, 25);
@@ -1582,17 +1433,15 @@ wss.on("connection", (ws, req) => {
         sendTo(ws, { type: "modBlocked", reason: editCheck.reason });
         return;
       }
-      // Find in rooms or DM history — match by accountId (persistent) or senderId (session)
-      const myAccId = client.accountId || null;
-      const canEdit = (m) => m.id === data.id && (m.senderId === clientId || (myAccId && m.accountId && m.accountId === myAccId));
+      // Find in rooms or DM history
       let found = null;
       for (const hist of Object.values(rooms)) {
-        found = hist.find(canEdit);
+        found = hist.find(m => m.id === data.id && m.senderId === clientId);
         if (found) break;
       }
       if (!found) {
         for (const hist of dmHistory.values()) {
-          found = hist.find(canEdit);
+          found = hist.find(m => m.id === data.id && m.senderId === clientId);
           if (found) break;
         }
       }
@@ -1607,16 +1456,14 @@ wss.on("connection", (ws, req) => {
     if (data.type === "delete") {
       const client = clients.get(ws);
       const canDeleteAny = client && client.isHost;
-      const delAccId = client?.accountId || null;
-      const canDel = (m) => canDeleteAny || m.senderId === clientId || (delAccId && m.accountId && m.accountId === delAccId);
       let found = false;
       for (const hist of Object.values(rooms)) {
-        const idx = hist.findIndex(m => m.id === data.id && canDel(m));
+        const idx = hist.findIndex(m => m.id === data.id && (canDeleteAny || m.senderId === clientId));
         if (idx !== -1) { hist.splice(idx, 1); found = true; break; }
       }
       if (!found) {
         for (const hist of dmHistory.values()) {
-          const idx = hist.findIndex(m => m.id === data.id && canDel(m));
+          const idx = hist.findIndex(m => m.id === data.id && (canDeleteAny || m.senderId === clientId));
           if (idx !== -1) { hist.splice(idx, 1); found = true; break; }
         }
       }
@@ -1864,7 +1711,30 @@ wss.on("connection", (ws, req) => {
   });
 });
 
+const nets = os.networkInterfaces();
+const localIPs = [];
+for (const ifaces of Object.values(nets))
+  for (const iface of ifaces)
+    if (iface.family === "IPv4" && !iface.internal) localIPs.push(iface.address);
+
+const discoverySocket = dgram.createSocket("udp4");
+function discoveryPayload() {
+  return Buffer.from(JSON.stringify({ type: "lan-chat-discovery", name: "A Cool Little Chat", port: PORT, ips: localIPs, ts: Date.now() }));
+}
+discoverySocket.on("message", (msg, rinfo) => {
+  const text = msg.toString();
+  if (text === "LAN_CHAT_DISCOVER") discoverySocket.send(discoveryPayload(), rinfo.port, rinfo.address);
+});
+discoverySocket.bind(DISCOVERY_PORT, () => {
+  discoverySocket.setBroadcast(true);
+  setInterval(() => {
+    discoverySocket.send(discoveryPayload(), DISCOVERY_PORT, "255.255.255.255");
+  }, 2000);
+});
+
 console.log("\n╔══════════════════════════════════════╗");
-console.log("║   Chat Server running on port: " + PORT + "   ║");
+console.log("║   LAN Chat Server running on :4242   ║");
+console.log("╠══════════════════════════════════════╣");
+localIPs.forEach(ip => console.log(`║  ws://${ip}:4242${" ".repeat(28 - ip.length)}║`));
 console.log("╚══════════════════════════════════════╝\n");
-console.log("Server is live. Share your Render URL with users.\n");
+console.log("Share the IP above with anyone on the same WiFi.\n");
