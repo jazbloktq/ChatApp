@@ -190,6 +190,13 @@ async function checkServerUpdate() {
 setTimeout(() => checkServerUpdate(), 10000);
 setInterval(() => checkServerUpdate(), UPDATE_CHECK_INTERVAL_MS);
 
+// ── Test OpenRouter key at startup ──
+setTimeout(() => {
+  callOpenRouter(AI_MODELS[0], [{ role: 'user', content: 'say "ok"' }])
+    .then(r => console.log(`[AI] Key OK — model: ${r.model}`))
+    .catch(e => console.error(`[AI] Key test FAILED: ${e.message}`));
+}, 5000);
+
 const http = require("http");
 const PORT = process.env.PORT || 4242;
 
@@ -266,14 +273,24 @@ function callOpenRouter(model, messages) {
       res.on('data', c => chunks.push(c));
       res.on('end', () => {
         try {
-          const data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-          if (data.error) return reject(new Error(data.error.message || 'API error'));
+          const raw = Buffer.concat(chunks).toString('utf8');
+          const data = JSON.parse(raw);
+          if (data.error) {
+            console.error(`[AI] OpenRouter error for ${model}: ${JSON.stringify(data.error)}`);
+            return reject(new Error(data.error.message || 'API error'));
+          }
           const text = data.choices?.[0]?.message?.content;
-          if (!text) return reject(new Error('No response text'));
+          if (!text) {
+            console.error(`[AI] No text in response for ${model}. HTTP ${res.statusCode}. Body: ${raw.slice(0, 300)}`);
+            return reject(new Error('No response text'));
+          }
           resolve({ text, model: data.model || model });
-        } catch (e) { reject(e); }
+        } catch (e) {
+          console.error(`[AI] JSON parse error for ${model}:`, e.message);
+          reject(e);
+        }
       });
-      res.on('error', reject);
+      res.on('error', (e) => { console.error(`[AI] Request error for ${model}:`, e.message); reject(e); });
     });
     req.on('error', reject);
     req.setTimeout(30000, () => { req.destroy(new Error('timeout')); });
@@ -754,6 +771,7 @@ function makeContextMessage(client, data, clientId, color) {
     id: nextMsgId(),
     name: client.name,
     senderId: clientId,
+    accountId: client.accountId || null,
     color,
     text: String(data.text || "").slice(0, 6000),
     image,
@@ -1564,15 +1582,17 @@ wss.on("connection", (ws, req) => {
         sendTo(ws, { type: "modBlocked", reason: editCheck.reason });
         return;
       }
-      // Find in rooms or DM history
+      // Find in rooms or DM history — match by accountId (persistent) or senderId (session)
+      const myAccId = client.accountId || null;
+      const canEdit = (m) => m.id === data.id && (m.senderId === clientId || (myAccId && m.accountId && m.accountId === myAccId));
       let found = null;
       for (const hist of Object.values(rooms)) {
-        found = hist.find(m => m.id === data.id && m.senderId === clientId);
+        found = hist.find(canEdit);
         if (found) break;
       }
       if (!found) {
         for (const hist of dmHistory.values()) {
-          found = hist.find(m => m.id === data.id && m.senderId === clientId);
+          found = hist.find(canEdit);
           if (found) break;
         }
       }
@@ -1587,14 +1607,16 @@ wss.on("connection", (ws, req) => {
     if (data.type === "delete") {
       const client = clients.get(ws);
       const canDeleteAny = client && client.isHost;
+      const delAccId = client?.accountId || null;
+      const canDel = (m) => canDeleteAny || m.senderId === clientId || (delAccId && m.accountId && m.accountId === delAccId);
       let found = false;
       for (const hist of Object.values(rooms)) {
-        const idx = hist.findIndex(m => m.id === data.id && (canDeleteAny || m.senderId === clientId));
+        const idx = hist.findIndex(m => m.id === data.id && canDel(m));
         if (idx !== -1) { hist.splice(idx, 1); found = true; break; }
       }
       if (!found) {
         for (const hist of dmHistory.values()) {
-          const idx = hist.findIndex(m => m.id === data.id && (canDeleteAny || m.senderId === clientId));
+          const idx = hist.findIndex(m => m.id === data.id && canDel(m));
           if (idx !== -1) { hist.splice(idx, 1); found = true; break; }
         }
       }
