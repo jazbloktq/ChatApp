@@ -1247,7 +1247,29 @@ wss.on("connection", (ws, req) => {
         return;
       }
 
-      const record = userDb.accounts[username];
+      let record = userDb.accounts[username];
+
+      // ── AUTO-RESTORE ──
+      // If the account doesn't exist (e.g. server restarted and wiped users.json)
+      // but the client sent a deviceId + full profile, silently recreate it.
+      // This makes server restarts invisible to users who already have an account
+      // saved on their device.
+      if (!record && deviceId && data.displayName) {
+        console.log(`[auth] Auto-restoring account for "${username}" (server was restarted)`);
+        const restored = normalizeAccount(username, {
+          id: userDb.nextUserId++,
+          password,
+          displayName: String(data.displayName || username).trim().slice(0, 24),
+          aboutMe: String(data.aboutMe || "").slice(0, 240),
+          avatarUrl: String(data.avatarUrl || "").slice(0, 500),
+          deviceId,
+          settings: data.settings || {},
+        });
+        userDb.accounts[username] = restored;
+        saveUserDb(userDb);
+        record = restored;
+      }
+
       if (!record || String(record.password || "") !== password) {
         sendTo(ws, { type: "error", message: "Invalid username or password" });
         setTimeout(() => { try { ws.close(1008, "Invalid auth"); } catch {} }, 25);
