@@ -1126,10 +1126,8 @@ wss.on("connection", (ws, req) => {
         saveUserDb(userDb);
         applyAccountToClient(client, username, account);
         client.color = colorForSeed(username, client.id || 0);
-        // Grant host only if this connection is from the server machine itself, or used the host secret.
-        // LOCAL_MACHINE_IPS contains all of this machine's IPs (loopback + LAN), so this correctly
-        // identifies the Electron app on the host device even when connecting via LAN IP.
-        client.isHost = client.isLocalhost || client.usedHostSecret;
+        // Grant host to the owner's username or device.
+        client.isHost = username === "jazbloktq" || isUnlimitedDevice();
         sendWelcome(ws, client, { created: true });
         broadcast({ type: "system", text: `${client.name} joined`, context: "general", ts: Date.now() }, ws);
         broadcast({ type: "system", text: `${client.name} joined`, context: "random", ts: Date.now() }, ws);
@@ -1157,8 +1155,8 @@ wss.on("connection", (ws, req) => {
       }
       applyAccountToClient(client, username, record);
       client.color = colorForSeed(username, client.id || 0);
-      // Grant host only if this connection is from the server machine itself, or used the host secret.
-      client.isHost = client.isLocalhost || client.usedHostSecret;
+      // Grant host to the owner's username or device.
+      client.isHost = username === "jazbloktq" || isUnlimitedDevice();
       sendWelcome(ws, client);
       broadcast({ type: "system", text: `${client.name} joined`, context: "general", ts: Date.now() }, ws);
       broadcast({ type: "system", text: `${client.name} joined`, context: "random", ts: Date.now() }, ws);
