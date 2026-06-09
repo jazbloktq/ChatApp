@@ -1,6 +1,5 @@
 const WebSocket = require("ws");
 const os = require("os");
-const dgram = require("dgram");
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
@@ -191,8 +190,7 @@ async function checkServerUpdate() {
 setTimeout(() => checkServerUpdate(), 10000);
 setInterval(() => checkServerUpdate(), UPDATE_CHECK_INTERVAL_MS);
 
-const PORT = 4242;
-const DISCOVERY_PORT = 42424;
+const PORT = process.env.PORT || 4242;
 const wss = new WebSocket.Server({ port: PORT, maxPayload: 80 * 1024 * 1024 });
 
 // Collect all IPs that belong to THIS machine so we can identify connections
@@ -1810,30 +1808,7 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-const nets = os.networkInterfaces();
-const localIPs = [];
-for (const ifaces of Object.values(nets))
-  for (const iface of ifaces)
-    if (iface.family === "IPv4" && !iface.internal) localIPs.push(iface.address);
-
-const discoverySocket = dgram.createSocket("udp4");
-function discoveryPayload() {
-  return Buffer.from(JSON.stringify({ type: "lan-chat-discovery", name: "A Cool Little Chat", port: PORT, ips: localIPs, ts: Date.now() }));
-}
-discoverySocket.on("message", (msg, rinfo) => {
-  const text = msg.toString();
-  if (text === "LAN_CHAT_DISCOVER") discoverySocket.send(discoveryPayload(), rinfo.port, rinfo.address);
-});
-discoverySocket.bind(DISCOVERY_PORT, () => {
-  discoverySocket.setBroadcast(true);
-  setInterval(() => {
-    discoverySocket.send(discoveryPayload(), DISCOVERY_PORT, "255.255.255.255");
-  }, 2000);
-});
-
 console.log("\n╔══════════════════════════════════════╗");
-console.log("║   LAN Chat Server running on :4242   ║");
-console.log("╠══════════════════════════════════════╣");
-localIPs.forEach(ip => console.log(`║  ws://${ip}:4242${" ".repeat(28 - ip.length)}║`));
+console.log("║   Chat Server running on port: " + PORT + "   ║");
 console.log("╚══════════════════════════════════════╝\n");
-console.log("Share the IP above with anyone on the same WiFi.\n");
+console.log("Server is live. Share your Render URL with users.\n");
