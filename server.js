@@ -190,8 +190,17 @@ async function checkServerUpdate() {
 setTimeout(() => checkServerUpdate(), 10000);
 setInterval(() => checkServerUpdate(), UPDATE_CHECK_INTERVAL_MS);
 
+const http = require("http");
 const PORT = process.env.PORT || 4242;
-const wss = new WebSocket.Server({ port: PORT, maxPayload: 80 * 1024 * 1024 });
+
+// HTTP server handles health checks (for cron-job.org keepalive) AND WebSocket upgrades
+const httpServer = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("OK");
+});
+
+const wss = new WebSocket.Server({ server: httpServer, maxPayload: 80 * 1024 * 1024 });
+httpServer.listen(PORT);
 
 // Collect all IPs that belong to THIS machine so we can identify connections
 // from the same device (host machine), whether they connect via localhost OR their LAN IP.
@@ -245,7 +254,7 @@ function callOpenRouter(model, messages) {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': 'Bearer ' + AI_KEY,
-        'HTTP-Referer': 'https://lanchat.local',
+        'HTTP-Referer': 'https://chatapp-4gbn.onrender.com',
         'X-Title': 'LAN Chat AI Bot',
         'Content-Length': Buffer.byteLength(body),
       },
@@ -367,9 +376,10 @@ async function handleAiCommand(ws, client, data, triggerMsg, room, isDM) {
       response = await callOpenRouter(model, apiMessages);
       break;
     } catch (e) {
-      // try next model
+      console.error(`[AI] Model ${model} failed:`, e.message);
     }
   }
+  if (!response) console.error("[AI] All models failed.");
 
   let replyText;
   try {
