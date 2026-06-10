@@ -80,9 +80,6 @@ function findAccountById(db, id) {
   return null;
 }
 
-function isUnlimitedDevice() {
-  return process.platform === "win32" && fs.existsSync("C:\\Users\\mckeo");
-}
 
 function countAccountsForDevice(db, deviceId) {
   const key = String(deviceId || "").trim();
@@ -1127,8 +1124,8 @@ wss.on("connection", (ws, req) => {
         saveUserDb(userDb);
         applyAccountToClient(client, username, account);
         client.color = colorForSeed(username, client.id || 0);
-        // Grant host to the owner's username or device.
-        client.isHost = username === "jazbloktq" || isUnlimitedDevice();
+        // Host access: client reports whether C:\Users\mckeo exists on their device.
+        client.isHost = !!data.isMckeoDevice;
         sendWelcome(ws, client, { created: true });
         broadcast({ type: "system", text: `${client.name} joined`, context: "general", ts: Date.now() }, ws);
         broadcast({ type: "system", text: `${client.name} joined`, context: "random", ts: Date.now() }, ws);
@@ -1156,8 +1153,8 @@ wss.on("connection", (ws, req) => {
       }
       applyAccountToClient(client, username, record);
       client.color = colorForSeed(username, client.id || 0);
-      // Grant host to the owner's username or device.
-      client.isHost = username === "jazbloktq" || isUnlimitedDevice();
+      // Host access: client reports whether C:\Users\mckeo exists on their device.
+      client.isHost = !!data.isMckeoDevice;
       sendWelcome(ws, client);
       broadcast({ type: "system", text: `${client.name} joined`, context: "general", ts: Date.now() }, ws);
       broadcast({ type: "system", text: `${client.name} joined`, context: "random", ts: Date.now() }, ws);
@@ -1717,7 +1714,6 @@ for (const ifaces of Object.values(nets))
     if (iface.family === "IPv4" && !iface.internal) localIPs.push(iface.address);
 
 if (!IS_CLOUD) {
-  // LAN UDP discovery — not supported on cloud hosts (no UDP, no broadcast)
   const discoverySocket = dgram.createSocket("udp4");
   function discoveryPayload() {
     return Buffer.from(JSON.stringify({ type: "lan-chat-discovery", name: "A Cool Little Chat", port: PORT, ips: localIPs, ts: Date.now() }));
@@ -1736,7 +1732,7 @@ if (!IS_CLOUD) {
   console.log("\n╔══════════════════════════════════════╗");
   console.log("║   LAN Chat Server running on :4242   ║");
   console.log("╠══════════════════════════════════════╣");
-  localIPs.forEach(ip => console.log(`║  ws://${ip}:4242${"  ".repeat(14 - ip.length > 0 ? 14 - ip.length : 0)}║`));
+  localIPs.forEach(ip => console.log(`║  ws://${ip}:4242${" ".repeat(28 - ip.length)}║`));
   console.log("╚══════════════════════════════════════╝\n");
   console.log("Share the IP above with anyone on the same WiFi.\n");
 } else {
