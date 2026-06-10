@@ -237,6 +237,8 @@ async function handleAiCommand(ws, client, data, triggerMsg, room, isDM) {
     `  /pong — Pong (DM only)\n` +
     `  /tron — Tron light cycles (DM only)\n` +
     `  /barricade — Barricade board game (DM only)\n` +
+    `  /trivia — Start a trivia quiz in a group room (up to 10 questions, multiple choice, click or type the answer). Use /trivia stop to end early.\n` +
+    `  /wordrace — Start a Word Race in a group room (8 rounds, type the displayed word first to score a point). Use /wordrace stop to end early.\n` +
     `- BARRICADE GAME: Classic board game. 9×9 grid. Each player has one pawn and up to 8 wall segments. On your turn you EITHER move your pawn OR place a barricade wall — not both. Walls are 2 cells long. You cannot place a wall that would completely block your opponent's only path. Cyan (X) starts at row 8 moving toward row 0; Red (O) starts at row 0 moving toward row 8. First to reach the opposite starting row wins.\n` +
     `- AUTO-CONNECT: On the connect screen the app automatically scans for servers on the local network.\n` +
     `- HOST FEATURES: The person running server.js is the host. They can delete any message. The host secret is printed in the server console — paste it as "ip#secret" in the Server IP field to get host privileges from another machine.\n` +
@@ -479,6 +481,251 @@ function sendTo(ws, data) {
   if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(data));
 }
 
+// ── SERVER-AUTHORITATIVE TRON TICK LOOP ──
+const TRON_TICK_MS = 110; // ~9 ticks/sec — smooth but LAN-safe
+const tronTimers = new Map(); // msgId -> intervalId
+
+function startTronLoop(msg) {
+  if (tronTimers.has(msg.id)) return;
+  const GRID = 30;
+  const timer = setInterval(() => {
+    const state = msg.game.state;
+    if (!state || state.status !== "playing") {
+      clearInterval(timer);
+      tronTimers.delete(msg.id);
+      return;
+    }
+    // Apply pending direction changes
+    for (const key of ["x", "o"]) {
+      const p = state[key];
+      if (!p) continue;
+      if (p.pendingDir) { p.dir = p.pendingDir; delete p.pendingDir; }
+    }
+    // Step both snakes
+    const moves = { up:{dx:0,dy:-1}, down:{dx:0,dy:1}, left:{dx:-1,dy:0}, right:{dx:1,dy:0} };
+    const newPos = {};
+    let collision = null;
+    for (const key of ["x", "o"]) {
+      const p = state[key];
+      if (!p) continue;
+      // Stamp current cell as trail BEFORE moving
+      const oldIdx = p.y * GRID + p.x;
+      state.grid[oldIdx] = key === "x" ? 1 : 2;
+      const m = moves[p.dir] || { dx: 1, dy: 0 };
+      const nx = p.x + m.dx, ny = p.y + m.dy;
+      // Wall collision
+      if (nx < 0 || ny < 0 || nx >= GRID || ny >= GRID) {
+        state.status = key === "x" ? "O wins" : "X wins";
+        collision = true; break;
+      }
+      // Trail collision
+      const newIdx = ny * GRID + nx;
+      if (state.grid[newIdx]) {
+        state.status = key === "x" ? "O wins" : "X wins";
+        collision = true; break;
+      }
+      newPos[key] = { nx, ny, newIdx };
+    }
+    if (!collision) {
+      // Check head-on collision (both land on same cell)
+      if (newPos.x && newPos.o && newPos.x.nx === newPos.o.nx && newPos.x.ny === newPos.o.ny) {
+        state.status = "draw";
+      } else {
+        for (const key of ["x", "o"]) {
+          if (newPos[key]) { state[key].x = newPos[key].nx; state[key].y = newPos[key].ny; }
+        }
+      }
+    }
+    if (state.status !== "playing") {
+      clearInterval(timer);
+      tronTimers.delete(msg.id);
+    }
+    // Broadcast authoritative state to both players
+    const update = { type: "gameUpdate", id: msg.id, game: msg.game };
+    for (const [ows, oc] of clients) {
+      if (oc.id === msg.game.players?.x || oc.id === msg.game.players?.o) sendTo(ows, update);
+    }
+  }, TRON_TICK_MS);
+  tronTimers.set(msg.id, timer);
+}
+
+// ── TRIVIA GAME (group rooms) ──
+const roomTrivia = new Map(); // room -> triviaGame
+const TRIVIA_QUESTIONS = [
+  { q: "What is the capital of Australia?", a: "canberra", opts: ["Sydney","Melbourne","Canberra","Brisbane"] },
+  { q: "How many sides does a hexagon have?", a: "6", opts: ["5","6","7","8"] },
+  { q: "What is 12 × 12?", a: "144", opts: ["124","134","144","154"] },
+  { q: "Which planet is closest to the Sun?", a: "mercury", opts: ["Venus","Mercury","Mars","Earth"] },
+  { q: "What year did World War II end?", a: "1945", opts: ["1943","1944","1945","1946"] },
+  { q: "How many bytes in a kilobyte?", a: "1024", opts: ["512","1000","1024","2048"] },
+  { q: "What language is primarily used for web styling?", a: "css", opts: ["HTML","CSS","JavaScript","Python"] },
+  { q: "What is the fastest land animal?", a: "cheetah", opts: ["Lion","Cheetah","Horse","Leopard"] },
+  { q: "How many continents are there?", a: "7", opts: ["5","6","7","8"] },
+  { q: "What is the chemical symbol for Gold?", a: "au", opts: ["Go","Gd","Au","Ag"] },
+  { q: "Who wrote Romeo and Juliet?", a: "shakespeare", opts: ["Dickens","Shakespeare","Tolkien","Austen"] },
+  { q: "What is the square root of 64?", a: "8", opts: ["6","7","8","9"] },
+  { q: "Which ocean is the largest?", a: "pacific", opts: ["Atlantic","Indian","Arctic","Pacific"] },
+  { q: "What color is chlorophyll?", a: "green", opts: ["Blue","Green","Yellow","Red"] },
+  { q: "How many strings does a standard guitar have?", a: "6", opts: ["4","5","6","7"] },
+  { q: "What gas do plants absorb from the air?", a: "co2", opts: ["Oxygen","Nitrogen","CO2","Hydrogen"] },
+  { q: "What is the hardest natural substance?", a: "diamond", opts: ["Iron","Titanium","Quartz","Diamond"] },
+  { q: "In what country is the Eiffel Tower?", a: "france", opts: ["Italy","Spain","France","Germany"] },
+  { q: "What does CPU stand for?", a: "central processing unit", opts: ["Central Processing Unit","Core Power Unit","Computer Processing Unit","Central Program Unit"] },
+  { q: "How many hours in a day?", a: "24", opts: ["12","24","36","48"] },
+];
+
+function startTrivia(room, starterId, starterName) {
+  if (roomTrivia.has(room)) { return "A trivia game is already running! Use /trivia stop to end it."; }
+  const game = {
+    room, status: "idle", scores: {}, playerNames: {}, answered: new Map(),
+    qIdx: 0, questionTimer: null, roundCount: 0, maxRounds: 10,
+    shuffled: [...TRIVIA_QUESTIONS].sort(() => Math.random() - 0.5),
+  };
+  roomTrivia.set(room, game);
+  broadcastToRoom(room, { type: "triviaEvent", room, event: "start",
+    text: `🧠 Trivia started by ${starterName}! ${game.maxRounds} questions. Type the answer or click a button. Use /trivia stop to end.` });
+  setTimeout(() => askTriviaQuestion(room), 2000);
+  return null;
+}
+
+function broadcastToRoom(room, data) {
+  for (const [ws, c] of clients) {
+    if (c.currentRoom === room) sendTo(ws, data);
+  }
+}
+
+function askTriviaQuestion(room) {
+  const game = roomTrivia.get(room);
+  if (!game) return;
+  if (game.roundCount >= game.maxRounds) { endTrivia(room, "rounds"); return; }
+  const q = game.shuffled[game.qIdx % game.shuffled.length];
+  game.qIdx++;
+  game.roundCount++;
+  game.currentQ = q;
+  game.status = "question";
+  game.answered = new Map();
+  game.questionStart = Date.now();
+  broadcastToRoom(room, { type: "triviaEvent", room, event: "question",
+    round: game.roundCount, maxRounds: game.maxRounds,
+    question: q.q, options: q.opts, timeMs: 15000 });
+  game.questionTimer = setTimeout(() => revealTriviaAnswer(room), 15000);
+}
+
+function revealTriviaAnswer(room) {
+  const game = roomTrivia.get(room);
+  if (!game) return;
+  clearTimeout(game.questionTimer);
+  game.status = "reveal";
+  const q = game.currentQ;
+  // Score: first correct gets 3pts, others get 1pt; time bonus for fast answers
+  const correct = [];
+  let first = true;
+  const sorted = [...game.answered.entries()].sort((a,b) => a[1].ts - b[1].ts);
+  for (const [id, entry] of sorted) {
+    const ans = String(entry.answer).trim().toLowerCase();
+    const correctAns = String(q.a).trim().toLowerCase();
+    if (ans === correctAns || q.opts.find(o => o.toLowerCase() === ans && o.toLowerCase() === correctAns)) {
+      const pts = first ? 3 : 1;
+      game.scores[id] = (game.scores[id] || 0) + pts;
+      game.playerNames[id] = entry.name;
+      correct.push({ name: entry.name, pts });
+      first = false;
+    }
+  }
+  const standings = Object.entries(game.scores)
+    .map(([id, s]) => ({ id: Number(id), name: game.playerNames[id] || "?", score: s }))
+    .sort((a,b) => b.score - a.score);
+  broadcastToRoom(room, { type: "triviaEvent", room, event: "reveal",
+    answer: q.a, correct, standings, round: game.roundCount, maxRounds: game.maxRounds });
+  setTimeout(() => {
+    if (game.roundCount >= game.maxRounds) endTrivia(room, "rounds");
+    else askTriviaQuestion(room);
+  }, 4000);
+}
+
+function endTrivia(room, reason) {
+  const game = roomTrivia.get(room);
+  if (!game) return;
+  clearTimeout(game.questionTimer);
+  roomTrivia.delete(room);
+  const standings = Object.entries(game.scores)
+    .map(([id, s]) => ({ id: Number(id), name: game.playerNames[id] || "?", score: s }))
+    .sort((a,b) => b.score - a.score);
+  broadcastToRoom(room, { type: "triviaEvent", room, event: "end", standings, reason });
+}
+
+// ── WORD RACE GAME (group rooms) ──
+const roomWordRace = new Map(); // room -> wordRaceGame
+const WORD_RACE_WORDS = [
+  "elephant","journey","mystery","cascade","horizon","crystal","dolphin","lantern",
+  "whisper","thunder","glacier","pattern","freedom","phoenix","quantum","harvest",
+  "chimney","diamond","eclipse","feather","gravity","highway","imagine","kitchen",
+  "leopard","machine","network","octopus","pendant","quarter","rainbow","serpent",
+  "tornado","uniform","village","warrior","express","younger","zealous","blanket",
+  "captain","density","ecology","factory","gallery","habitat","invoice","jackpot",
+  "kingdom","library","magenta","nucleus","opinion","pyramid","quality","reality",
+  "station","texture","upgrade","vitamin","weekend","xenon","yonder","zipper",
+];
+
+function startWordRace(room, starterId, starterName) {
+  if (roomWordRace.has(room)) return "A Word Race is already running! Use /wordrace stop to end it.";
+  const game = {
+    room, status: "idle", scores: {}, playerNames: {}, roundWinners: new Map(),
+    round: 0, maxRounds: 8, currentWord: null, roundTimer: null,
+    wordPool: [...WORD_RACE_WORDS].sort(() => Math.random() - 0.5),
+  };
+  // Seed player names from current room occupants
+  for (const c of clients.values()) {
+    if (c.currentRoom === room && c.id) {
+      game.playerNames[c.id] = c.name;
+      game.scores[c.id] = 0;
+    }
+  }
+  roomWordRace.set(room, game);
+  broadcastToRoom(room, { type: "wordRaceEvent", room, event: "start",
+    text: `🏁 Word Race started by ${starterName}! Type each word first to score. ${game.maxRounds} rounds.` });
+  setTimeout(() => nextWordRaceRound(room), 2500);
+  return null;
+}
+
+function nextWordRaceRound(room) {
+  const game = roomWordRace.get(room);
+  if (!game) return;
+  game.round++;
+  if (game.round > game.maxRounds) { endWordRace(room, "rounds"); return; }
+  game.currentWord = game.wordPool[(game.round - 1) % game.wordPool.length];
+  game.roundWinners = new Map();
+  game.status = "racing";
+  broadcastToRoom(room, { type: "wordRaceEvent", room, event: "round",
+    round: game.round, maxRounds: game.maxRounds, word: game.currentWord, timeMs: 12000 });
+  game.roundTimer = setTimeout(() => advanceWordRaceRound(room), 12000);
+}
+
+function advanceWordRaceRound(room) {
+  const game = roomWordRace.get(room);
+  if (!game) return;
+  clearTimeout(game.roundTimer);
+  game.status = "between";
+  const standings = Object.entries(game.scores)
+    .map(([id, s]) => ({ id: Number(id), name: game.playerNames[id] || "?", score: s }))
+    .sort((a,b) => b.score - a.score);
+  broadcastToRoom(room, { type: "wordRaceEvent", room, event: "roundEnd",
+    word: game.currentWord, round: game.round, maxRounds: game.maxRounds,
+    winners: [...game.roundWinners.values()].map(w => w.name), standings });
+  setTimeout(() => nextWordRaceRound(room), 3500);
+}
+
+function endWordRace(room, reason) {
+  const game = roomWordRace.get(room);
+  if (!game) return;
+  clearTimeout(game.roundTimer);
+  roomWordRace.delete(room);
+  const standings = Object.entries(game.scores)
+    .map(([id, s]) => ({ id: Number(id), name: game.playerNames[id] || "?", score: s }))
+    .sort((a,b) => b.score - a.score);
+  broadcastToRoom(room, { type: "wordRaceEvent", room, event: "end", standings, reason });
+}
+
 function sendUserList() {
   const users = [...clients.values()]
     .filter(c => c?.name && c.name !== "null")
@@ -682,6 +929,8 @@ function sendMessageToContext(ws, client, data, msg, clientId) {
     for (const [ows, oc] of clients) {
       if (oc.id === toId) { sendTo(ows, msg); break; }
     }
+    // Start server-authoritative Tron loop as soon as the game message is created
+    if (msg.game?.kind === "tron") startTronLoop(msg);
   } else {
     msg.room = data.room || "general";
     const hist = rooms[msg.room];
@@ -1236,6 +1485,8 @@ wss.on("connection", (ws, req) => {
 
     // --- MESSAGE (room or DM) ---
     if (data.type === "message") {
+      // Track which room this client is currently in
+      if (!data.toId && data.room) client.currentRoom = data.room;
       // Check server-side timeout
       const toUntil = timeouts.get(clientId);
       if (toUntil) {
@@ -1264,6 +1515,33 @@ wss.on("connection", (ws, req) => {
       const textCheck = moderateText(String(data.text || ""));
       if (!textCheck.ok) {
         sendTo(ws, { type: "modBlocked", reason: textCheck.reason });
+        return;
+      }
+
+      // ── /trivia command ──
+      const textLower = String(data.text || "").trim().toLowerCase();
+      if (!isDM && (textLower === "/trivia" || textLower.startsWith("/trivia "))) {
+        const room = data.room || "general";
+        if (textLower === "/trivia stop" || textLower === "/trivia end") {
+          if (roomTrivia.has(room)) { endTrivia(room, "stopped"); }
+          else sendTo(ws, { type: "system", text: "No trivia game is running.", context: room, ts: Date.now() });
+        } else {
+          const err = startTrivia(room, clientId, client.name);
+          if (err) sendTo(ws, { type: "system", text: err, context: room, ts: Date.now() });
+        }
+        return;
+      }
+
+      // ── /wordrace command ──
+      if (!isDM && (textLower === "/wordrace" || textLower.startsWith("/wordrace "))) {
+        const room = data.room || "general";
+        if (textLower === "/wordrace stop" || textLower === "/wordrace end") {
+          if (roomWordRace.has(room)) { endWordRace(room, "stopped"); }
+          else sendTo(ws, { type: "system", text: "No Word Race is running.", context: room, ts: Date.now() });
+        } else {
+          const err = startWordRace(room, clientId, client.name);
+          if (err) sendTo(ws, { type: "system", text: err, context: room, ts: Date.now() });
+        }
         return;
       }
 
@@ -1406,6 +1684,8 @@ wss.on("connection", (ws, req) => {
       const msg = findMessage(Number(data.id));
       if (!msg?.game || !msg.dm) return;
       if (msg.fromId !== clientId && msg.toId !== clientId) return;
+      // Tron is server-authoritative — tronDir packets handle it, not gamePacket
+      if (msg.game.kind === "tron") return;
       const packet = data.packet || {};
       msg.game.state = packet.state ?? msg.game.state;
       msg.game.turn = packet.turn ?? msg.game.turn;
@@ -1414,6 +1694,54 @@ wss.on("connection", (ws, req) => {
       const update = { type: "gameUpdate", id: msg.id, game: msg.game };
       for (const [ows, oc] of clients) {
         if (oc.id === msg.fromId || oc.id === msg.toId) sendTo(ows, update);
+      }
+      return;
+    }
+
+    // --- TRON DIRECTION (server-authoritative Tron) ---
+    if (data.type === "tronDir") {
+      const msg = findMessage(Number(data.id));
+      if (!msg?.game || msg.game.kind !== "tron") return;
+      if (msg.fromId !== clientId && msg.toId !== clientId) return;
+      const state = msg.game.state;
+      if (!state || state.status !== "playing") return;
+      const playerKey = (msg.game.players?.x === clientId) ? "x" : (msg.game.players?.o === clientId ? "o" : null);
+      if (!playerKey) return;
+      const opp = { up: "down", down: "up", left: "right", right: "left" };
+      const dir = data.dir;
+      if (!["up","down","left","right"].includes(dir)) return;
+      if (state[playerKey] && dir !== opp[state[playerKey].dir]) {
+        state[playerKey].pendingDir = dir;
+      }
+      return;
+    }
+
+    // --- TRIVIA ANSWER ---
+    if (data.type === "triviaAnswer") {
+      const game = roomTrivia.get(data.room);
+      if (!game || game.status !== "question") return;
+      if (game.answered.has(clientId)) return;
+      game.answered.set(clientId, { answer: data.answer, name: client.name, ts: Date.now() });
+      return;
+    }
+
+    // --- WORDRACE INPUT ---
+    if (data.type === "wordRaceInput") {
+      const game = roomWordRace.get(data.room);
+      if (!game || game.status !== "racing") return;
+      const word = String(data.word || "").trim().toLowerCase();
+      if (word === game.currentWord && !game.roundWinners.has(clientId)) {
+        game.roundWinners.set(clientId, { name: client.name, ts: Date.now() });
+        game.scores[clientId] = (game.scores[clientId] || 0) + 1;
+        const standings = Object.entries(game.scores)
+          .map(([id, s]) => ({ id: Number(id), name: game.playerNames[id] || "?", score: s }))
+          .sort((a,b) => b.score - a.score);
+        const update = { type: "wordRaceUpdate", room: data.room, event: "correct",
+          player: { id: clientId, name: client.name },
+          scores: standings, word: game.currentWord };
+        broadcast(update);
+        const activePlayers = [...clients.values()].filter(c => c.id).length;
+        if (game.roundWinners.size >= activePlayers) advanceWordRaceRound(data.room);
       }
       return;
     }
