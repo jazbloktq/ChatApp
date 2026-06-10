@@ -92,7 +92,8 @@ function countAccountsForDevice(db, deviceId) {
 
 
 
-const PORT = 4242;
+const IS_CLOUD = !!process.env.PORT;
+const PORT = process.env.PORT ? parseInt(process.env.PORT) : 4242;
 const DISCOVERY_PORT = 42424;
 const wss = new WebSocket.Server({ port: PORT, maxPayload: 80 * 1024 * 1024 });
 
@@ -1715,24 +1716,29 @@ for (const ifaces of Object.values(nets))
   for (const iface of ifaces)
     if (iface.family === "IPv4" && !iface.internal) localIPs.push(iface.address);
 
-const discoverySocket = dgram.createSocket("udp4");
-function discoveryPayload() {
-  return Buffer.from(JSON.stringify({ type: "lan-chat-discovery", name: "A Cool Little Chat", port: PORT, ips: localIPs, ts: Date.now() }));
-}
-discoverySocket.on("message", (msg, rinfo) => {
-  const text = msg.toString();
-  if (text === "LAN_CHAT_DISCOVER") discoverySocket.send(discoveryPayload(), rinfo.port, rinfo.address);
-});
-discoverySocket.bind(DISCOVERY_PORT, () => {
-  discoverySocket.setBroadcast(true);
-  setInterval(() => {
-    discoverySocket.send(discoveryPayload(), DISCOVERY_PORT, "255.255.255.255");
-  }, 2000);
-});
+if (!IS_CLOUD) {
+  // LAN UDP discovery — not supported on cloud hosts (no UDP, no broadcast)
+  const discoverySocket = dgram.createSocket("udp4");
+  function discoveryPayload() {
+    return Buffer.from(JSON.stringify({ type: "lan-chat-discovery", name: "A Cool Little Chat", port: PORT, ips: localIPs, ts: Date.now() }));
+  }
+  discoverySocket.on("message", (msg, rinfo) => {
+    const text = msg.toString();
+    if (text === "LAN_CHAT_DISCOVER") discoverySocket.send(discoveryPayload(), rinfo.port, rinfo.address);
+  });
+  discoverySocket.bind(DISCOVERY_PORT, () => {
+    discoverySocket.setBroadcast(true);
+    setInterval(() => {
+      discoverySocket.send(discoveryPayload(), DISCOVERY_PORT, "255.255.255.255");
+    }, 2000);
+  });
 
-console.log("\n╔══════════════════════════════════════╗");
-console.log("║   LAN Chat Server running on :4242   ║");
-console.log("╠══════════════════════════════════════╣");
-localIPs.forEach(ip => console.log(`║  ws://${ip}:4242${" ".repeat(28 - ip.length)}║`));
-console.log("╚══════════════════════════════════════╝\n");
-console.log("Share the IP above with anyone on the same WiFi.\n");
+  console.log("\n╔══════════════════════════════════════╗");
+  console.log("║   LAN Chat Server running on :4242   ║");
+  console.log("╠══════════════════════════════════════╣");
+  localIPs.forEach(ip => console.log(`║  ws://${ip}:4242${"  ".repeat(14 - ip.length > 0 ? 14 - ip.length : 0)}║`));
+  console.log("╚══════════════════════════════════════╝\n");
+  console.log("Share the IP above with anyone on the same WiFi.\n");
+} else {
+  console.log(`[render] Server listening on port ${PORT}`);
+}
